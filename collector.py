@@ -10,18 +10,53 @@ import json, re, sys, os, datetime, statistics, time
 import requests
 from bs4 import BeautifulSoup
 
-UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
-      "Accept-Language": "en"}
+try:
+    from curl_cffi import requests as cffi  # эмуляция TLS-отпечатка Chrome — против анти-бот 403
+except ImportError:
+    cffi = None
+
+UA = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 TODAY = datetime.date.today().isoformat()
 
 # ---------- утилиты ----------
-def get(url, **kw):
+def get(url, extra=None, tries=3):
+    """GET с эмуляцией Chrome (curl_cffi) и ретраями на 403/429/5xx; None при неудаче."""
+    last = None
+    for i in range(tries):
+        try:
+            h = {**UA, **(extra or {})}
+            if cffi:
+                r = cffi.get(url, headers=h, impersonate="chrome", timeout=25)
+            else:
+                r = requests.get(url, headers=h, timeout=25)
+            if r.status_code == 200:
+                return r
+            last = f"HTTP {r.status_code}"
+            if r.status_code not in (403, 408, 429, 500, 502, 503, 504):
+                break  # 404 и прочее ретраить бессмысленно
+        except Exception as e:
+            last = e
+        time.sleep(3 * (i + 1))
+    print(f"  ! {url[:80]} -> {last}", file=sys.stderr, flush=True)
+    return None
+
+def get_json(url, referer=None):
+    """GET, ожидающий JSON; если пришёл HTML (бот-заглушка) — печатает первые байты."""
+    extra = {"Accept": "application/json, text/plain, */*"}
+    if referer:
+        extra["Referer"] = referer
+    r = get(url, extra=extra)
+    if not r:
+        return None
     try:
-        r = requests.get(url, headers=UA, timeout=25, **kw)
-        r.raise_for_status()
-        return r
-    except Exception as e:
-        print(f"  ! {url[:80]} -> {e}", file=sys.stderr)
+        return r.json()
+    except Exception:
+        head = re.sub(r"\s+", " ", (r.text or "")[:70])
+        print(f"  ! не-JSON от {url[:60]} -> «{head}»", file=sys.stderr, flush=True)
         return None
 
 PACK_RE = re.compile(r'(\d+(?:[.,]\d+)?)\s*(kg|кг|kgs|kilo)', re.I)
@@ -38,13 +73,40 @@ def summarize(vals):
     return {"median": round(statistics.median(vals)), "min": round(min(vals)),
             "max": round(max(vals)), "n": len(vals)}
 
+def ldjson_products(html):
+    """[(title, price)] из <script type="application/ld+json"> — общий запасной парсер."""
+    out = []
+    for m in re.finditer(r'<script[^>]*application/ld\+json[^>]*>(.*?)</script>', html or "", re.S | re.I):
+        try:
+            data = json.loads(m.group(1).strip())
+        except Exception:
+            continue
+        stack = [data]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                if str(node.get("@type", "")).lower() == "product":
+                    offers = node.get("offers") or {}
+                    if isinstance(offers, list):
+                        offers = offers[0] if offers else {}
+                    price = offers.get("price") or offers.get("lowPrice")
+                    if price:
+                        try:
+                            out.append((node.get("name", ""), float(str(price).replace(",", ""))))
+                        except Exception:
+                            pass
+                stack.extend(node.values())
+            elif isinstance(node, list):
+                stack.extend(node)
+    return out
+
 # ---------- курсы ----------
 def fx_rates():
     out = {}
-    r = get("https://open.er-api.com/v6/latest/USD")
-    if r:
-        rates = r.json().get("rates", {})
-        for c in ["INR","PKR","KES","TZS","BDT","LKR","MZN","OMR","AED","CNY"]:
+    data = get_json("https://open.er-api.com/v6/latest/USD")
+    if data:
+        rates = data.get("rates", {})
+        for c in ["INR","PKR","KES","TZS","BDT","LKR","UGX","MZN","OMR","AED","CNY"]:
             if c in rates: out[c] = rates[c]
     return out
 
@@ -72,27 +134,34 @@ def pinksheet():
             return {"date": str(last[0]), "urea_fob": col("Urea"), "dap_fob": col("DAP"),
                     "tsp_fob": col("TSP"), "mop_fob": col("Potassium")}
     except Exception as e:
-        print(f"  ! pinksheet -> {e}", file=sys.stderr)
+        print(f"  ! pinksheet -> {e}", file=sys.stderr, flush=True)
     return None
 
 # ---------- адаптеры маркетплейсов ----------
 def bighaat(query):
-    """Индия. BigHaat = Shopify -> публичный /products.json (самый надёжный адаптер)"""
+    """Индия. Ступень 1: Shopify-автоподсказка; ступень 2: JSON-LD со страницы поиска."""
     vals = []
-    r = get(f"https://www.bighaat.com/search/suggest.json?q={requests.utils.quote(query)}&resources[type]=product&resources[limit]=10")
-    if r:
+    q = requests.utils.quote(query)
+    data = get_json(f"https://www.bighaat.com/search/suggest.json?q={q}&resources[type]=product&resources[limit]=10",
+                    referer="https://www.bighaat.com/")
+    if data:
         try:
-            for p in r.json()["resources"]["results"].get("products", []):
-                price = float(p.get("price", 0))
-                vals.append(price_per_ton(price, p.get("title","")))
+            for p in data["resources"]["results"].get("products", []):
+                vals.append(price_per_ton(float(p.get("price", 0) or 0), p.get("title", "")))
         except Exception as e:
-            print(f"  ! bighaat parse -> {e}", file=sys.stderr)
+            print(f"  ! bighaat parse -> {e}", file=sys.stderr, flush=True)
+    if not vals:
+        r = get(f"https://www.bighaat.com/search?q={q}", extra={"Referer": "https://www.bighaat.com/"})
+        if r:
+            for title, price in ldjson_products(r.text)[:12]:
+                vals.append(price_per_ton(price, title))
     return vals  # INR/t
 
 def jumia(query, domain="jumia.co.ke"):
-    """Кения (и .co.tz нет — Танзания через jiji). Парсим карточки листинга."""
+    """Кения. Карточки листинга; фолбэк — JSON-LD."""
     vals = []
-    r = get(f"https://www.{domain}/catalog/?q={requests.utils.quote(query)}")
+    r = get(f"https://www.{domain}/catalog/?q={requests.utils.quote(query)}",
+            extra={"Referer": f"https://www.{domain}/"})
     if r:
         soup = BeautifulSoup(r.text, "html.parser")
         for art in soup.select("article.prd")[:12]:
@@ -101,33 +170,47 @@ def jumia(query, domain="jumia.co.ke"):
             digits = re.sub(r"[^\d.]", "", prc.get_text().split("-")[0])
             if digits:
                 vals.append(price_per_ton(float(digits), name.get_text()))
+        if not vals:
+            for title, price in ldjson_products(r.text)[:12]:
+                vals.append(price_per_ton(price, title))
     return vals  # KES/t
 
 def jiji(query, host="jiji.co.ke"):
     """Jiji (Кения/Танзания/Уганда...) — полупубличный JSON-эндпоинт листинга."""
     vals = []
-    r = get(f"https://{host}/api_web/v1/listing?query={requests.utils.quote(query)}&page=1")
-    if r:
+    q = requests.utils.quote(query)
+    data = get_json(f"https://{host}/api_web/v1/listing?query={q}&page=1",
+                    referer=f"https://{host}/search?query={q}")
+    if data:
         try:
-            for ad in r.json().get("adverts_list", {}).get("adverts", [])[:15]:
+            for ad in data.get("adverts_list", {}).get("adverts", [])[:15]:
                 price = ad.get("price_obj", {}).get("value") or ad.get("price")
                 title = ad.get("title","")
                 if price: vals.append(price_per_ton(float(price), title))
         except Exception as e:
-            print(f"  ! jiji parse -> {e}", file=sys.stderr)
+            print(f"  ! jiji parse -> {e}", file=sys.stderr, flush=True)
     return vals
 
 def daraz(query, host="www.daraz.pk"):
-    """Пакистан/Бангладеш(daraz.com.bd). Цены сидят в JSON внутри страницы."""
+    """Пакистан/Бангладеш/Шри-Ланка. Цены в window.pageData (JSON внутри страницы)."""
     vals = []
-    r = get(f"https://{host}/catalog/?q={requests.utils.quote(query)}")
-    if r:
-        for m in re.finditer(r'"price":"?([\d.]+)"?.{0,400}?"name":"(.*?)"', r.text):
-            try: vals.append(price_per_ton(float(m.group(1)), m.group(2)))
-            except: pass
-        if not vals:
-            for m in re.finditer(r'"priceShow":"Rs\.\s*([\d,]+)".{0,400}?"name":"(.*?)"', r.text):
-                vals.append(price_per_ton(float(m.group(1).replace(",","")), m.group(2)))
+    r = get(f"https://{host}/catalog/?q={requests.utils.quote(query)}",
+            extra={"Referer": f"https://{host}/"})
+    if not r:
+        return vals
+    m = re.search(r'window\.pageData\s*=\s*(\{.*?\})\s*</script>', r.text, re.S)
+    if m:
+        try:
+            for it in (json.loads(m.group(1)).get("mods", {}).get("listItems", []) or [])[:15]:
+                price = it.get("price") or re.sub(r"[^\d.]", "", str(it.get("priceShow", "")))
+                if price:
+                    vals.append(price_per_ton(float(str(price).replace(",", "")), it.get("name", "")))
+        except Exception as e:
+            print(f"  ! daraz parse -> {e}", file=sys.stderr, flush=True)
+    if not vals:  # старый запасной regex по сырому HTML
+        for mm in re.finditer(r'"price":"?([\d.]+)"?.{0,400}?"name":"(.*?)"', r.text):
+            try: vals.append(price_per_ton(float(mm.group(1)), mm.group(2)))
+            except Exception: pass
     return vals
 
 # ---------- конфиг целей ----------
@@ -149,10 +232,14 @@ TARGETS = {
 }
 
 def main():
+    if not cffi:
+        print("  ! curl_cffi не установлен — работаю без эмуляции Chrome (выше риск 403)",
+              file=sys.stderr, flush=True)
     fx = fx_rates()
     out = {"updated": TODAY, "fx": fx, "benchmark": pinksheet(), "markets": {}}
+    total = 0
     for market, cfg in TARGETS.items():
-        print(f"== {market}")
+        print(f"== {market}", flush=True)
         mres = {}
         rate = fx.get(cfg["ccy"])
         for grade, q in cfg["grades"].items():
@@ -162,13 +249,16 @@ def main():
                 s["ccy"] = cfg["ccy"]
                 if rate: s["usd_t_median"] = round(s["median"] / rate)
                 mres[grade] = s
-                print(f"   {grade}: n={s['n']} median {s['median']} {cfg['ccy']}/t" + (f" ≈ ${s.get('usd_t_median')}/t" if rate else ""))
+                total += s["n"]
+                print(f"   {grade}: n={s['n']} median {s['median']} {cfg['ccy']}/t" + (f" ≈ ${s.get('usd_t_median')}/t" if rate else ""), flush=True)
             time.sleep(1.5)
+        if not mres:
+            print("   (пусто — источник не отдал ни одной цены)", flush=True)
         out["markets"][market] = mres
     os.makedirs("history", exist_ok=True)
     json.dump(out, open("prices.json","w",encoding="utf-8"), ensure_ascii=False, indent=1)
     json.dump(out, open(f"history/{TODAY}.json","w",encoding="utf-8"), ensure_ascii=False, indent=1)
-    print("OK -> prices.json")
+    print(f"OK -> prices.json (собрано позиций: {total})", flush=True)
 
 if __name__ == "__main__":
     main()
