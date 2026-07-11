@@ -6,7 +6,7 @@ Price Radar Collector — узел Салала
 бенчмарки World Bank Pink Sheet. Пишет prices.json + history/.
 Запуск: python collector.py   (планировщик — GitHub Actions, см. .github/workflows/daily.yml)
 """
-import json, re, sys, datetime, statistics, time
+import json, re, sys, os, datetime, statistics, time
 import requests
 from bs4 import BeautifulSoup
 
@@ -165,6 +165,7 @@ def main():
                 print(f"   {grade}: n={s['n']} median {s['median']} {cfg['ccy']}/t" + (f" ≈ ${s.get('usd_t_median')}/t" if rate else ""))
             time.sleep(1.5)
         out["markets"][market] = mres
+    os.makedirs("history", exist_ok=True)
     json.dump(out, open("prices.json","w",encoding="utf-8"), ensure_ascii=False, indent=1)
     json.dump(out, open(f"history/{TODAY}.json","w",encoding="utf-8"), ensure_ascii=False, indent=1)
     print("OK -> prices.json")
