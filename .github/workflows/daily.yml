@@ -1,0 +1,23 @@
+name: price-radar-daily
+on:
+  schedule:
+    - cron: "20 4 * * *"   # 08:20 по Дубаю ежедневно
+  workflow_dispatch: {}
+permissions:
+  contents: write
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements.txt
+      - run: python collector.py
+      - name: commit data
+        run: |
+          git config user.name "radar-bot"
+          git config user.email "bot@radar"
+          git add prices.json history/
+          git commit -m "prices $(date -u +%F)" || echo "no changes"
+          git push

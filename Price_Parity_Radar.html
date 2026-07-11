@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ценовой радар узла: обратный расчёт закупочной цены</title>
+<style>
+  :root { --ink:#22303c; --steel:#5a6b7a; --line:#d8dee4; --bg:#f6f8fa; --acc:#b3661f; --ok:#1c7c4d; --bad:#b03030; --card:#ffffff; }
+  * { box-sizing:border-box; }
+  body { font-family:'Segoe UI',system-ui,sans-serif; margin:0; background:var(--bg); color:var(--ink); padding:18px; }
+  h1 { font-size:21px; margin:0 0 4px; }
+  .sub { color:var(--steel); font-size:12.5px; margin-bottom:14px; }
+  .warn { background:#fdf3e3; border:1px solid #ecd9b0; border-radius:8px; padding:8px 12px; font-size:12.5px; color:#7a5a1f; margin-bottom:14px; }
+  .panel { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:14px; }
+  .panel h2 { font-size:15px; margin:0 0 10px; }
+  label { font-size:12px; color:var(--steel); display:block; margin-bottom:2px; }
+  select,input { font-size:14px; padding:6px 8px; border:1px solid var(--line); border-radius:6px; width:100%; background:#fff; color:var(--ink); }
+  input:focus,select:focus { outline:2px solid #c9d8e6; }
+  .grid { display:grid; gap:10px; }
+  .g4 { grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { padding:7px 8px; border-bottom:1px solid var(--line); text-align:right; }
+  th { background:#eef2f5; color:var(--ink); font-size:12px; text-align:right; }
+  th:first-child,td:first-child { text-align:left; }
+  td.step { color:var(--steel); }
+  .big { font-size:16px; font-weight:700; }
+  .ok { color:var(--ok); font-weight:700; }
+  .bad { color:var(--bad); font-weight:700; }
+  .chain td { font-size:12.5px; }
+  button { background:var(--ink); color:#fff; border:none; border-radius:7px; padding:8px 14px; font-size:13px; cursor:pointer; margin-right:8px; }
+  button.ghost { background:#fff; color:var(--ink); border:1px solid var(--line); }
+  .foot { color:var(--steel); font-size:11.5px; margin-top:10px; line-height:1.5; }
+  .pill { display:inline-block; background:#eef2f5; border-radius:20px; padding:2px 10px; font-size:11.5px; color:var(--steel); margin-left:6px; }
+</style>
+</head>
+<body>
+<h1>Ценовой радар узла <span class="pill">обратный расчёт: розница → CIF → FCA Salalah</span></h1>
+<div class="sub">Логика: розничная цена рынка − НДС − маржа ритейла − маржа дистрибьютора − внутренняя логистика − очистка/порт − пошлина = целевая CIF; − фрахт из Салалы = целевая FCA Salalah; − наша себестоимость = маржа узла.</div>
+<div class="warn">⚠ Все предзаполненные числа — оценки июля-2026 для калибровки структуры. Еженедельный протокол радара: обнови розницу с BigHaat/IndiaMART (Индия), Daraz (PK/BD), Jiji/Jumia (EA), курсы — и таблица пересчитается. Ничего не сохраняется между сессиями — жми «Экспорт CSV» после ввода.</div>
+
+<div class="warn" id="live" style="background:#e9f4ee;border-color:#bfe0cc;color:#1c5c3d;display:none"></div>
+<div class="panel">
+  <h2>1. Рынок и допущения цепочки <span class="pill">все поля редактируемые</span></h2>
+  <div class="grid g4">
+    <div><label>Рынок</label><select id="market"></select></div>
+    <div><label>Курс к USD (местная/USD)</label><input type="number" id="fx" step="0.01"></div>
+    <div><label>НДС/GST на удобрение, %</label><input type="number" id="vat" step="0.5"></div>
+    <div><label>Импортная пошлина + сборы, %</label><input type="number" id="duty" step="0.5"></div>
+    <div id="cepaBox" style="display:none"><label>CEPA Индия—Оман (в силе с 01.06.2026)</label>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:6px 8px;background:#fff">
+      <input type="checkbox" id="cepaChk" style="width:auto"> оманский CO → пошлина 0%*</label></div>
+    <div><label>Маржа ритейла (дилер→фермер), %</label><input type="number" id="mret" step="0.5"></div>
+    <div><label>Маржа дистрибьютора (импортёр→дилер), %</label><input type="number" id="mdist" step="0.5"></div>
+    <div><label>Внутренняя логистика, $/т</label><input type="number" id="inland" step="1"></div>
+    <div><label>Очистка + порт + документы, $/т</label><input type="number" id="clear" step="1"></div>
+    <div><label>Фрахт Салала → рынок (бокс), $/т</label><input type="number" id="frt" step="1"></div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>2. Розничные цены и наша себестоимость по грейдам <span class="pill">розница — в местной валюте за КГ</span></h2>
+  <table id="gradesT">
+    <thead><tr><th>Грейд</th><th>Розница, мест./кг</th><th>Наша себестоимость FCA, $/т</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<div class="panel">
+  <h2>3. Результат: цепочка вниз и вердикт по марже</h2>
+  <table id="outT">
+    <thead><tr>
+      <th>Грейд</th><th>Розница $/т</th><th>без НДС</th><th>цена дилера</th><th>цена импортёра (landed)</th><th>− логистика/очистка</th><th>Целевая CIF $/т</th><th class="big">Целевая FCA Salalah</th><th>Маржа узла $/т</th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+  <div class="warn" id="cepaNote" style="display:none;background:#e9f0fa;border-color:#c3d4ea;color:#1f3d5c;margin-top:10px"></div>
+  <div style="margin-top:12px">
+    <button onclick="exportCSV()">Экспорт CSV</button>
+    <button class="ghost" onclick="resetMarket()">Сбросить рынок к дефолтам</button>
+  </div>
+  <div class="foot">Чтение вердикта: <b class="ok">зелёная маржа ≥ $60/т</b> — грейд проходит правило двух спредов; жёлтая $20–60 — тонко, ищем дисконтную ногу сырья; <b class="bad">красная &lt; $20</b> — в этом рынке грейд не продаётся с узла, канал только сырьевой. Источники розницы: Индия — BigHaat/IndiaMART/AgroStar; Пакистан/Бангладеш — Daraz + NFDC; Кения/Танзания — Jumia/Jiji + AfricaFertilizer.org; Мозамбик — коридорные дилеры. Строки с пометкой «субсид.» (индийские DAP/карбамид) — административная розница госканала: обратный расчёт по ним не работает, они в таблице только как справка полки. Argus/Pink Sheet держит верхний якорь (FOB-уровни производителей) — если целевая CIF ниже Argus-FOB+фрахт, рынок закрыт для всех, не только для нас.</div>
+</div>
+
+<script>
+const MARKETS = {
+  "Индия":      { fx:84,  vat:12, duty:7.5, mret:15, mdist:12, inland:35, clear:22, frt:15,
+    retail:{ "WSF 19-19-19 (Cl)":115, "WSF 13-0-45":135, "MKP 0-52-34":165, "SOP 0-0-50":95, "WSF 18-18-18+5S":128, "DAP 18-46 (субсид.!)":27, "Карбамид (розн., несубс. tech)":45 } },
+  "Пакистан":   { fx:278, vat:5,  duty:3,   mret:14, mdist:12, inland:28, clear:20, frt:12,
+    retail:{ "WSF 19-19-19 (Cl)":900, "WSF 13-0-45":1100, "MKP 0-52-34":1350, "SOP 0-0-50":620, "WSF 18-18-18+5S":980, "DAP 18-46":390, "Карбамид (розн., несубс. tech)":300 } },
+  "Кения":      { fx:129, vat:0,  duty:2.5, mret:18, mdist:14, inland:30, clear:25, frt:26,
+    retail:{ "WSF 19-19-19 (Cl)":320, "WSF 13-0-45":390, "MKP 0-52-34":480, "SOP 0-0-50":260, "WSF 18-18-18+5S":345, "DAP 18-46":88, "Карбамид (розн., несубс. tech)":95 } },
+  "Танзания":   { fx:2700,vat:0,  duty:2,   mret:18, mdist:14, inland:35, clear:22, frt:19,
+    retail:{ "WSF 19-19-19 (Cl)":6500,"WSF 13-0-45":7800, "MKP 0-52-34":9500, "SOP 0-0-50":5200, "WSF 18-18-18+5S":7000, "DAP 18-46":2650, "Карбамид (розн., несубс. tech)":1900 } },
+  "Бангладеш":  { fx:120, vat:0,  duty:3,   mret:14, mdist:12, inland:25, clear:22, frt:24,
+    retail:{ "WSF 19-19-19 (Cl)":260, "WSF 13-0-45":320, "MKP 0-52-34":400, "SOP 0-0-50":210, "WSF 18-18-18+5S":280, "Карбамид (розн., несубс. tech)":85 } },
+  "Шри-Ланка":  { fx:300, vat:0,  duty:2.5, mret:16, mdist:12, inland:20, clear:20, frt:16,
+    retail:{ "WSF 19-19-19 (Cl)":700, "WSF 13-0-45":850, "MKP 0-52-34":1050, "SOP 0-0-50":560, "WSF 18-18-18+5S":760, "Карбамид (розн., несубс. tech)":230 } },
+  "Мозамбик/коридор": { fx:64, vat:0, duty:2.5, mret:20, mdist:15, inland:45, clear:28, frt:24,
+    retail:{ "WSF 19-19-19 (Cl)":170, "WSF 13-0-45":205, "MKP 0-52-34":255, "SOP 0-0-50":135, "WSF 18-18-18+5S":185, "DAP 18-46":44, "Карбамид (розн., несубс. tech)":48 } }
+};
+const COGS = { "WSF 19-19-19 (Cl)":610, "WSF 18-18-18+5S":700, "WSF 13-0-45":1050, "MKP 0-52-34":950, "SOP 0-0-50":720, "DAP 18-46":690, "DAP 18-46 (субсид.!)":690, "Карбамид (розн., несубс. tech)":470 };
+let cur = "Индия";
+const $ = id => document.getElementById(id);
+
+function initMarkets(){
+  const s = $("market");
+  Object.keys(MARKETS).forEach(m=>{ const o=document.createElement("option"); o.value=o.textContent=m; s.appendChild(o); });
+  s.value = cur;
+  s.onchange = ()=>{ cur=s.value; loadMarket(); };
+}
+function loadMarket(){
+  const M = MARKETS[cur];
+  ["fx","vat","duty","mret","mdist","inland","clear","frt"].forEach(k=>{ $(k).value=M[k]; $(k).oninput=calc; });
+  const tb = $("gradesT").querySelector("tbody"); tb.innerHTML="";
+  Object.keys(M.retail).forEach(g=>{
+    const tr=document.createElement("tr");
+    tr.innerHTML = `<td style="text-align:left">${g}</td>
+      <td><input type="number" step="1" data-g="${g}" class="rin" value="${M.retail[g]}"></td>
+      <td><input type="number" step="5" data-g="${g}" class="cin" value="${COGS[g]}"></td>`;
+    tb.appendChild(tr);
+  });
+  document.querySelectorAll(".rin,.cin").forEach(i=>i.oninput=calc);
+  const cb=document.getElementById('cepaBox'); if(cb){ cb.style.display = (cur==='Индия')?'block':'none'; const chk=document.getElementById('cepaChk'); if(chk) chk.onchange=calc; }
+  calc();
+}
+function num(id){ return parseFloat($(id).value)||0; }
+function calc(){
+  const fx=num("fx"), vat=num("vat")/100, mret=num("mret")/100, mdist=num("mdist")/100;
+  let duty=num("duty")/100;
+  const chk=document.getElementById("cepaChk");
+  const cepaOn=(cur==="Индия" && chk && chk.checked);
+  const mfnDuty=duty; if(cepaOn) duty=0;
+  const inland=num("inland"), clear=num("clear"), frt=num("frt");
+  const tb=$("outT").querySelector("tbody"); tb.innerHTML="";
+  const rows=[];
+  document.querySelectorAll(".rin").forEach(inp=>{
+    const g=inp.dataset.g;
+    const retailKg=parseFloat(inp.value)||0;
+    const cogs=parseFloat(document.querySelector(`.cin[data-g="${g}"]`).value)||0;
+    const retailUsdT = retailKg*1000/fx;
+    const exVat = retailUsdT/(1+vat);
+    const dealer = exVat/(1+mret);
+    const landed = dealer/(1+mdist);
+    const preClear = landed - inland - clear;
+    const cif = preClear/(1+duty);
+    const fca = cif - frt;
+    const margin = fca - cogs;
+    rows.push([g,retailUsdT,exVat,dealer,landed,inland+clear,cif,fca,margin]);
+    const cls = margin>=60?"ok":(margin>=20?"":"bad");
+    const col = margin>=60?"ok":(margin>=20?"":"bad");
+    tb.insertAdjacentHTML("beforeend",
+     `<tr class="chain"><td style="text-align:left"><b>${g}</b></td>
+      <td>${retailUsdT.toFixed(0)}</td><td class="step">${exVat.toFixed(0)}</td>
+      <td class="step">${dealer.toFixed(0)}</td><td class="step">${landed.toFixed(0)}</td>
+      <td class="step">−${(inland+clear).toFixed(0)}</td>
+      <td>${cif.toFixed(0)}</td><td class="big">${fca.toFixed(0)}</td>
+      <td class="${col}">${margin>=0?"+":""}${margin.toFixed(0)}</td></tr>`);
+  });
+  window._rows=rows;
+  const note=document.getElementById("cepaNote");
+  if(note){ if(cepaOn){ note.style.display="block"; note.textContent=`Применена CEPA-преференция: пошлина 0% вместо MFN ${(mfnDuty*100).toFixed(1)}% — выигрыш ≈ $${Math.round((window._rows[0]?window._rows[0][6]:600)*mfnDuty)}/т на строке. *Условно: PSR-тест гл.31 и FZ-квалификация — проверки Фазы 0; карбамид в Индию каналализирован независимо от пошлины.`;} else note.style.display="none"; }
+}
+function exportCSV(){
+  let csv="Рынок;"+cur+"\nГрейд;Розница $/т;без НДС;Дилер;Импортёр landed;Логистика+очистка;Целевая CIF;Целевая FCA Salalah;Маржа узла\n";
+  (window._rows||[]).forEach(r=>{ csv+=r.map((v,i)=>typeof v==="number"?v.toFixed(0):v).join(";")+"\n"; });
+  const blob=new Blob(["\ufeff"+csv],{type:"text/csv;charset=utf-8"});
+  const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download=`price_radar_${cur}.csv`; a.click();
+}
+function resetMarket(){ loadMarket(); }
+async function loadLive(){
+  try{
+    const r = await fetch('prices.json?ts='+Date.now());
+    if(!r.ok) return;
+    const d = await r.json();
+    // курсы
+    const fxmap = {"Индия":"INR","Пакистан":"PKR","Кения":"KES","Танзания":"TZS","Бангладеш":"BDT","Шри-Ланка":"LKR","Мозамбик/коридор":"MZN"};
+    let touched = 0;
+    for (const [mkt,ccy] of Object.entries(fxmap)) if (d.fx && d.fx[ccy] && MARKETS[mkt]) MARKETS[mkt].fx = +d.fx[ccy].toFixed(2);
+    // розница: медианы сборщика -> дефолты (локальная валюта за кг = median_t/1000)
+    for (const [mkt,grades] of Object.entries(d.markets||{})){
+      if(!MARKETS[mkt]) continue;
+      for (const [g,st] of Object.entries(grades)){
+        if (st && st.median && MARKETS[mkt].retail[g]!==undefined){ MARKETS[mkt].retail[g] = +(st.median/1000).toFixed(1); touched++; }
+      }
+    }
+    const b = document.getElementById('live');
+    let msg = `⛁ Живые данные сборщика от ${d.updated}: обновлено ${touched} ценовых точек, курсы валют — автоматически.`;
+    if (d.benchmark && d.benchmark.urea_fob) msg += ` Бенчмарк Pink Sheet (${d.benchmark.date}): Urea FOB $${Math.round(d.benchmark.urea_fob)}, DAP $${Math.round(d.benchmark.dap_fob)}, MOP $${Math.round(d.benchmark.mop_fob)}.`;
+    b.textContent = msg; b.style.display='block';
+    loadMarket();
+  }catch(e){ /* оффлайн/file:// -> остаёмся на встроенных дефолтах */ }
+}
+initMarkets(); loadMarket(); loadLive();
+</script>
+</body>
+</html>
